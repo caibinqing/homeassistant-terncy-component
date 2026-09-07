@@ -62,6 +62,14 @@ class TerncyZCListener:
         dev_id = name.replace("." + svc_type, "")
         txt_records = _parse_svc(dev_id, info)
 
+        if not txt_records[CONF_IP] and self.manager.hubs.get(dev_id, {}).get(CONF_IP):
+            # a transient network glitch can expire the A record, keep the last
+            # known good address instead of publishing a blank one
+            _LOGGER.debug(
+                "update_service %s has no address, keep the previous record", dev_id
+            )
+            return
+
         self.manager.hubs[dev_id] = txt_records
         self.manager.hass.bus.fire(TERNCY_EVENT_SVC_UPDATE, txt_records)
 
@@ -73,17 +81,21 @@ class TerncyZCListener:
         _LOGGER.debug("add_service %s %s %s", svc_type, name, info)
         dev_id = name.replace("." + svc_type, "")
         txt_records = {}
-        max_retry = 20
+        max_retry = 3
         while max_retry > 0:
             max_retry = max_retry - 1
             txt_records = _parse_svc(dev_id, info)
-            ipaddress = txt_records[CONF_IP]
-            _LOGGER.debug("ip address is parsed to %s", ipaddress)
-            if not ipaddress == "":
+            ip_addr = txt_records[CONF_IP]
+            _LOGGER.debug("ip address is parsed to %s", ip_addr)
+            if ip_addr != "":
                 break
-            _LOGGER.warning("ip %s is still not available, query again", ipaddress)
-            time.sleep(2)
+            # this runs on the shared zeroconf thread, so don't block it for
+            # long, a later update_service will carry the address anyway
+            _LOGGER.warning("ip address is still not available, query again")
+            time.sleep(1)
             info = zconf.get_service_info(svc_type, name)
+            if info is None:
+                return
 
         self.manager.hubs[dev_id] = txt_records
         self.manager.hass.bus.fire(TERNCY_EVENT_SVC_ADD, txt_records)

@@ -49,6 +49,7 @@ from ..const import (
     HA_CLIENT_ID,
     TERNCY_EVENT_SVC_ADD,
     TERNCY_EVENT_SVC_REMOVE,
+    TERNCY_EVENT_SVC_UPDATE,
     TERNCY_HUB_ID_PREFIX,
     TERNCY_MANU_NAME,
 )
@@ -72,6 +73,9 @@ from ..types import (
     SvcData,
 )
 
+RETRY_DELAY_MIN = 2  # seconds
+RETRY_DELAY_MAX = 300  # seconds
+
 SetupHandler = Callable[
     [
         ForwardRef("TerncyGateway"),
@@ -92,6 +96,8 @@ class TerncyGateway:
         self.config_entry = config_entry
 
         self._stopped = False
+        self._connect_task: asyncio.Task | None = None
+        self._retry_delay = RETRY_DELAY_MIN
 
         self.parsed_devices: dict[str, TerncyDevice] = {}  # key: eid
         self._listeners: dict[str, set[Callable[[list[AttrValue]], None]]] = {}
@@ -130,8 +136,8 @@ class TerncyGateway:
         tern = self.api
         self._stopped = False
 
-        def on_terncy_svc_add(event: Event):
-            """Terncy service found handler"""
+        def on_terncy_svc_found(event: Event):
+            """Terncy service found/updated handler"""
             dev_id = event.data[CONF_DEVID]
             if dev_id != tern.dev_id:
                 return
@@ -143,12 +149,13 @@ class TerncyGateway:
                     "dev %s's ip address is not valid. %s", dev_id, event.data
                 )
                 return
-            if not tern.is_connected():
-                tern.ip = ip
+            if ip != tern.ip:
                 self.logger = logging.getLogger(f"{__name__}.{ip}")
-                self.logger.debug("Start connecting %s", dev_id)
-                self._stopped = False
-                self.async_create_background_task(self.api.start(), "Start")
+                self.logger.debug("Hub %s address changed to %s", dev_id, ip)
+                tern.ip = ip
+            # a svc remove during a network glitch latches _stopped, release it
+            self._stopped = False
+            self._async_ensure_connection()
 
         def on_terncy_svc_remove(event: Event):
             """Terncy service stop handler"""
@@ -159,20 +166,59 @@ class TerncyGateway:
             self.logger.debug("on_terncy_svc_remove %s", event.data[CONF_DEVID])
             self.async_create_task(self.stop())
 
-        self.hass.bus.async_listen(TERNCY_EVENT_SVC_ADD, on_terncy_svc_add)
-        self.hass.bus.async_listen(TERNCY_EVENT_SVC_REMOVE, on_terncy_svc_remove)
+        # unsubscribe on unload, otherwise a later zeroconf event would revive
+        # a gateway that has already been torn down
+        for event_type, handler in (
+            (TERNCY_EVENT_SVC_ADD, on_terncy_svc_found),
+            (TERNCY_EVENT_SVC_UPDATE, on_terncy_svc_found),
+            (TERNCY_EVENT_SVC_REMOVE, on_terncy_svc_remove),
+        ):
+            self.config_entry.async_on_unload(
+                self.hass.bus.async_listen(event_type, handler)
+            )
 
+        # only override the config entry host with a discovered one when it is
+        # actually usable, an empty record must never clobber a working address
         hub_manager = TerncyHubManager.instance(self.hass)
-        if (txt_records := hub_manager.hubs.get(tern.dev_id)) and not self.is_connected:
+        if (txt_records := hub_manager.hubs.get(tern.dev_id)) and txt_records.get(
+            CONF_IP
+        ):
             tern.ip = txt_records[CONF_IP]
-            self.logger.debug("Start connection to %s", tern.dev_id)
-            self.async_create_background_task(self.api.start(), "Start")
 
         tern.register_event_handler(self.terncy_event_handler)
+
+        self.logger.debug("Start connection to %s", tern.dev_id)
+        self._async_ensure_connection()
 
     async def stop(self):
         self._stopped = True
         await self.api.stop()
+
+    def _async_ensure_connection(self):
+        """Single entry point for connecting, safe to call from any handler."""
+        if self._stopped or self.is_connected:
+            return
+        if self._connect_task and not self._connect_task.done():
+            self.logger.debug("a connection attempt is already in flight")
+            return
+        if not self.api.ip:
+            self.logger.warning("no valid hub ip yet, waiting for zeroconf")
+            return
+        self._connect_task = self.async_create_background_task(
+            self._async_connect(), "Start"
+        )
+
+    async def _async_connect(self):
+        """Run one connection attempt and keep the retry chain alive."""
+        try:
+            await self.api.start()
+        except Exception:  # noqa: BLE001
+            # never let the task die silently, that would strand the gateway
+            # until the config entry is reloaded
+            self.logger.exception("Connection to %s failed", self.api.dev_id)
+        # api.start() returns once the connection is gone, whatever the reason
+        if not self._stopped and not self.is_connected:
+            self.async_create_background_task(self.reconnect(), "Reconnect")
 
     async def reconnect(self):
         """Terncy service retry connection handler"""
@@ -180,13 +226,25 @@ class TerncyGateway:
             self.logger.debug("service stopped, don't retry")
             return
 
-        await asyncio.sleep(2)
+        delay = self._retry_delay
+        self._retry_delay = min(self._retry_delay * 2, RETRY_DELAY_MAX)
+        await asyncio.sleep(delay)
+        if self._stopped:
+            self.logger.debug("service stopped, don't retry")
+            return
         if self.is_connected:
             self.logger.warning("service is still connected while retry")
             return
 
-        self.logger.warning("Start reconnecting...")
-        await self.api.start()
+        # pick up the latest discovered address instead of retrying a stale one
+        hub_manager = TerncyHubManager.instance(self.hass)
+        if (txt_records := hub_manager.hubs.get(self.api.dev_id)) and txt_records.get(
+            CONF_IP
+        ):
+            self.api.ip = txt_records[CONF_IP]
+
+        self.logger.warning("Start reconnecting to %s...", self.api.ip)
+        self._async_ensure_connection()
 
     @property
     def unique_id(self):
@@ -269,14 +327,15 @@ class TerncyGateway:
 
         elif isinstance(event, Connected):
             self.logger.info("Connected: %s", self.unique_id)
+            self._retry_delay = RETRY_DELAY_MIN
             self.async_create_task(self.async_refresh_devices())
 
         elif isinstance(event, Disconnected):
             self.logger.warning("Disconnected: %s", self.unique_id)
             for device in self.parsed_devices.values():
                 device.set_available(False)
-            if not self._stopped:
-                self.async_create_background_task(self.reconnect(), "Reconnect")
+            # retrying is owned by _async_connect, which runs after api.start()
+            # returns for any reason, including errors that emit no event
 
         else:
             self.logger.warning("Unknown Event: %s", event)
